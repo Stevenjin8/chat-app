@@ -3,47 +3,58 @@ use std::clone::Clone;
 use std::sync::Arc;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 const BUF_SIZE: usize = 9999;
+const NICK_CMD: &[u8] = b"/nick ";
 
+/// Singly linked list node representing the write half of a connection.
 struct LLNode {
-    stream: Arc<Mutex<WriteHalf<TcpStream>>>,
+    /// the actual stream
+    stream: WriteHalf<TcpStream>,
+    /// the next node. None represents the end of the list.
     next: Option<Box<LLNode>>,
 }
 
 impl LLNode {
-    pub fn new(stream: Arc<Mutex<WriteHalf<TcpStream>>>) -> LLNode {
+    /// Create a new node.
+    pub fn new(stream: WriteHalf<TcpStream>) -> LLNode {
         LLNode { stream, next: None }
-    }
-
-    pub async fn add(self: &mut LLNode, value: Arc<Mutex<WriteHalf<TcpStream>>>) {
-        let mut current_node = self;
-        loop {
-            if current_node.next.is_none() {
-                current_node.next = Some(Box::new(LLNode::new(value.clone())));
-                return;
-            }
-            current_node = current_node.next.as_mut().unwrap();
-        }
     }
 }
 
 #[async_recursion]
-async fn broadcast(node: &LLNode, buf: &[u8], nickname: &[u8]) -> () {
+async fn broadcast(node: &mut LLNode, buf: &[u8], nickname: &[u8]) -> () {
     {
-        let mut node_lock = node.stream.lock().await;
-        node_lock.write(nickname).await.ok();
-        node_lock.write(b": ").await.ok();
-        node_lock.write(buf).await.ok();
+        // HELP: I want thoughts on my uses of ok/unwrap.
+        // Also, kind interesting that this still works even after I've closed connections
+        node.stream.write(nickname).await.ok();
+        node.stream.write(b": ").await.ok();
+        node.stream.write(buf).await.ok();
     }
-    match &node.next {
-        Some(next) => broadcast(next, buf, nickname).await,
-        _ => {}
-    };
+    if let Some(next) = &mut node.next {
+        broadcast(next, buf, nickname).await;
+    }
+}
+
+/// Add a node to the mutex
+async fn add(mut lock: MutexGuard<'_, Option<LLNode>>, value: WriteHalf<TcpStream>) {
+    // HELP: What's the point of the anonymous lifetime? Is it just because we need something?
+    // Is there a way to do this without calling unwrap?
+    // I realize there is insert with and unwrap_or, but I get move errors.
+    if let None = *lock {
+        *lock = Some(LLNode::new(value));
+    } else {
+        let mut new_node = Box::new(LLNode::new(value));
+        let mut head = lock.take().unwrap();
+        new_node.next = head.next;
+        head.next = Some(new_node);
+        *lock = Some(head);
+    }
 }
 
 #[tokio::main]
+// HELP: Why does dyn work but not impl
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:8081").await?;
     let stream_ll: Arc<Mutex<Option<LLNode>>> = Arc::new(Mutex::new(Option::None));
@@ -54,43 +65,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stream_ll = stream_ll.clone();
         tokio::spawn(async move {
             let mut nickname: Vec<u8> = Vec::from(b"name".as_slice());
-            let write_stream_mutex = Arc::new(Mutex::new(write_stream));
 
-            // we have to explicitly wrap this block in braces, or explictly drop `stream_ll_head`
+            // we have to explicitly wrap this block in braces, or explicitly drop `stream_ll_head`
             // to drop the lock on the mutex. Otherwise, we can only handle on active connection
             {
-                let mut stream_ll_head = stream_ll.lock().await;
-                if stream_ll_head.is_none() {
-                    let value = LLNode::new(write_stream_mutex);
-                    *stream_ll_head = Option::Some(value);
-                } else {
-                    stream_ll_head
-                        .as_mut()
-                        .unwrap()
-                        .add(write_stream_mutex)
-                        .await;
-                }
+                let stream_ll_head = stream_ll.lock().await;
+                add(stream_ll_head, write_stream).await;
             }
 
+            // Read write loop
             loop {
                 let mut buf: [u8; BUF_SIZE] = [0; BUF_SIZE];
                 let n_bytes = read_stream.read(&mut buf).await.unwrap();
                 if n_bytes == 0 {
+                    // the connection probably closed. Ideally, we would remove the corresponding
+                    // write stream from the linked list of streams
                     break;
                 }
-                match buf.strip_prefix(b"/nick ") {
+                match buf.strip_prefix(NICK_CMD) {
                     Some(nick) => {
+                        // The user wants a new nickname
+                        // HELP: Still not feeling too confident on string/byte manipulation.
                         nickname.clear();
                         nickname.extend_from_slice(nick);
-                        nickname.retain(|x| {*x != b'\n'});
+                        // HELP: feels like there should be a better way to do this. I tried having
+                        // b'\n'.eq be the argument, but that didn't work.
+                        nickname.retain(|x| *x != b'\n');
+                        // I hate that the formatter removes the braces
                     }
                     None => {
-                        match stream_ll.lock().await.as_ref() {
-                            Some(node) => {
-                                broadcast(node, &buf[0..n_bytes], &nickname[..]).await;
-                            }
-                            None => {}
-                        };
+                    // broadcast the message
+                        if let Some(node) = stream_ll.lock().await.as_mut() {
+                            broadcast(node, &buf[0..n_bytes], &nickname[..]).await;
+                        }
                     }
                 }
             }
