@@ -3,85 +3,150 @@ use std::clone::Clone;
 use std::sync::Arc;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::Mutex;
 
 const BUF_SIZE: usize = 9999;
 const NICK_CMD: &[u8] = b"/nick ";
 
 /// Singly linked list node representing the write half of a connection.
 struct LLNode {
-    /// the actual stream
     stream: WriteHalf<TcpStream>,
-    /// the next node. None represents the end of the list.
-    next: Option<Box<LLNode>>,
+    next: Option<Arc<Mutex<LLNode>>>,
+    prev: Option<Arc<Mutex<LLNode>>>,
 }
 
 impl LLNode {
-    /// Create a new node.
-    pub fn new(stream: WriteHalf<TcpStream>) -> LLNode {
-        LLNode { stream, next: None }
+    pub fn new(
+        stream: WriteHalf<TcpStream>,
+        next: Option<Arc<Mutex<LLNode>>>,
+        prev: Option<Arc<Mutex<LLNode>>>,
+    ) -> LLNode {
+        LLNode { stream, next, prev }
+    }
+}
+
+struct LinkedList {
+    /// prev of head is None and next of the tail is None.
+    head: Option<Arc<Mutex<LLNode>>>,
+}
+
+impl LinkedList {
+    /// Returns Arc to Node containing value. This is so we can remove it later.
+    pub async fn add(&mut self, value: WriteHalf<TcpStream>) -> Arc<Mutex<LLNode>> {
+        let new_node = Arc::new(Mutex::new(LLNode::new(value, self.head.take(), None)));
+        if let Some(ref x) = new_node.lock().await.next {
+            x.lock().await.prev = Some(new_node.clone());
+        };
+        self.head = Some(new_node.clone());
+        return new_node;
+    }
+
+    /// Removes first encounter of value. Pass in return of add.
+    pub async fn remove(&mut self, value: &Arc<Mutex<LLNode>>) {
+        if let Some(head) = &self.head {
+            let mut current = head.clone();
+            loop {
+                if Arc::ptr_eq(&current, value) {
+                    // Found a match
+                    let mut current_lock = current.lock().await;
+                    let prev = current_lock.prev.take();
+                    let next = current_lock.next.take();
+                    drop(current_lock);
+                    match &prev {
+                        Some(prev) => prev.lock().await.next = next.clone(),
+                        // the following should only happen if we are matched with the head.
+                        None => self.head = next.clone(),
+                    }
+                    if let Some(next) = &next {
+                        next.lock().await.prev = prev.clone();
+                    }
+                    return;
+                }
+
+                // would be nice to implement this as an async iterator.
+                match &current.clone().lock().await.next {
+                    Some(next) => current = next.clone(),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    pub async fn size(&self) -> usize {
+        let mut count: usize = 0;
+        if let Some(head) = &self.head {
+            let mut current = head.clone();
+            loop {
+                count += 1;
+
+                match &current.clone().lock().await.next {
+                    Some(next) => current = next.clone(),
+                    None => break,
+                }
+            }
+        }
+        return count;
+    }
+
+    pub fn new() -> LinkedList {
+        LinkedList { head: None }
     }
 }
 
 #[async_recursion]
-async fn broadcast(node: &mut LLNode, buf: &[u8], nickname: &[u8]) -> () {
+async fn broadcast(node: &mut Arc<Mutex<LLNode>>, buf: &[u8], nickname: &[u8]) -> () {
+    let mut lock = node.lock().await;
     {
         // HELP: I want thoughts on my uses of ok/unwrap.
         // Also, kind interesting that this still works even after I've closed connections
-        node.stream.write(nickname).await.ok();
-        node.stream.write(b": ").await.ok();
-        node.stream.write(buf).await.ok();
+        lock.stream.write(nickname).await.ok();
+        lock.stream.write(b": ").await.ok();
+        lock.stream.write(buf).await.ok();
     }
-    if let Some(next) = &mut node.next {
-        broadcast(next, buf, nickname).await;
-    }
-}
-
-/// Add a node to the mutex
-async fn add(mut lock: MutexGuard<'_, Option<LLNode>>, value: WriteHalf<TcpStream>) {
-    // HELP: What's the point of the anonymous lifetime? Is it just because we need something?
-    // Is there a way to do this without calling unwrap?
-    // I realize there is insert with and unwrap_or, but I get move errors.
-    if let None = *lock {
-        *lock = Some(LLNode::new(value));
-    } else {
-        let mut new_node = Box::new(LLNode::new(value));
-        let mut head = lock.take().unwrap();
-        new_node.next = head.next;
-        head.next = Some(new_node);
-        *lock = Some(head);
+    if let Some(next) = &mut lock.next {
+        broadcast(&mut next.clone(), buf, nickname).await;
     }
 }
 
 #[tokio::main]
 // HELP: Why does dyn work but not impl
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:8081").await?;
-    let stream_ll: Arc<Mutex<Option<LLNode>>> = Arc::new(Mutex::new(Option::None));
+    let listener = TcpListener::bind("localhost:8081").await?;
+    let streams = Arc::new(Mutex::new(LinkedList::new()));
     loop {
         let (stream, _) = listener.accept().await?;
         let (mut read_stream, write_stream) = split(stream);
 
-        let stream_ll = stream_ll.clone();
+        let streams = streams.clone();
         tokio::spawn(async move {
             let mut nickname: Vec<u8> = Vec::from(b"name".as_slice());
 
             // we have to explicitly wrap this block in braces, or explicitly drop `stream_ll_head`
             // to drop the lock on the mutex. Otherwise, we can only handle on active connection
-            {
-                let stream_ll_head = stream_ll.lock().await;
-                add(stream_ll_head, write_stream).await;
-            }
+            let mut streams_lock = streams.lock().await;
+            let my_node = streams_lock.add(write_stream).await;
+            println!(
+                "There are {} active connections.",
+                streams_lock.size().await
+            );
+            drop(streams_lock);
 
             // Read write loop
             loop {
                 let mut buf: [u8; BUF_SIZE] = [0; BUF_SIZE];
+
                 let n_bytes = read_stream.read(&mut buf).await.unwrap();
                 if n_bytes == 0 {
-                    // the connection probably closed. Ideally, we would remove the corresponding
-                    // write stream from the linked list of streams
+                    // the connection probably closed.
+                    let mut streams_lock = streams.lock().await;
+                    streams_lock.remove(&my_node).await;
+                    println!(
+                        "There are {} active connections.",
+                        streams_lock.size().await
+                    );
                     break;
                 }
+
                 match buf.strip_prefix(NICK_CMD) {
                     Some(nick) => {
                         // The user wants a new nickname
@@ -94,9 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // I hate that the formatter removes the braces
                     }
                     None => {
-                    // broadcast the message
-                        if let Some(node) = stream_ll.lock().await.as_mut() {
-                            broadcast(node, &buf[0..n_bytes], &nickname[..]).await;
+                        // broadcast the message
+                        if let Some(ref mut node) = &mut streams.lock().await.head {
+                            broadcast(node, &buf[..n_bytes], &nickname[..]).await;
                         }
                     }
                 }
