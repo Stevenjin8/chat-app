@@ -38,7 +38,7 @@ impl LinkedList {
             x.lock().await.prev = Some(new_node.clone());
         };
         self.head = Some(new_node.clone());
-        return new_node;
+        new_node
     }
 
     /// Removes first encounter of value. Pass in return of add.
@@ -85,7 +85,7 @@ impl LinkedList {
                 }
             }
         }
-        return count;
+        count
     }
 
     pub fn new() -> LinkedList {
@@ -94,18 +94,17 @@ impl LinkedList {
 }
 
 #[async_recursion]
-async fn broadcast(node: &mut Arc<Mutex<LLNode>>, buf: &[u8], nickname: &[u8]) -> () {
+async fn broadcast(node: &mut Arc<Mutex<LLNode>>, buf: &[u8], nickname: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let mut lock = node.lock().await;
     {
-        // HELP: I want thoughts on my uses of ok/unwrap.
-        // Also, kind interesting that this still works even after I've closed connections
-        lock.stream.write(nickname).await.ok();
-        lock.stream.write(b": ").await.ok();
-        lock.stream.write(buf).await.ok();
+        lock.stream.write(nickname).await?;
+        lock.stream.write(b": ").await?;
+        lock.stream.write(buf).await?;
     }
     if let Some(next) = &mut lock.next {
-        broadcast(&mut next.clone(), buf, nickname).await;
+        broadcast(&mut next.clone(), buf, nickname).await?;
     }
+    Ok(())
 }
 
 #[tokio::main]
@@ -162,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => {
                         // broadcast the message
                         if let Some(ref mut node) = &mut streams.lock().await.head {
-                            broadcast(node, &buf[..n_bytes], &nickname[..]).await;
+                            broadcast(node, &buf[..n_bytes], &nickname[..]).await.unwrap();
                         }
                     }
                 }
