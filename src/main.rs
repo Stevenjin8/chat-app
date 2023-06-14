@@ -111,7 +111,8 @@ async fn broadcast(node: &mut Arc<Mutex<LLNode>>, buf: &[u8], nickname: &[u8]) -
 #[tokio::main]
 // HELP: Why does dyn work but not impl
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("localhost:8081").await?;
+    println!("Starting");
+    let listener = TcpListener::bind("0.0.0.0:8081").await?;
     let streams = Arc::new(Mutex::new(LinkedList::new()));
     loop {
         let (stream, _) = listener.accept().await?;
