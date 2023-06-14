@@ -94,7 +94,11 @@ impl LinkedList {
 }
 
 #[async_recursion]
-async fn broadcast(node: &mut Arc<Mutex<LLNode>>, buf: &[u8], nickname: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+async fn broadcast(
+    node: &mut Arc<Mutex<LLNode>>,
+    buf: &[u8],
+    nickname: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut lock = node.lock().await;
     {
         lock.stream.write(nickname).await?;
@@ -135,7 +139,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let mut buf: [u8; BUF_SIZE] = [0; BUF_SIZE];
 
-                let n_bytes = read_stream.read(&mut buf).await.unwrap();
+                let n_bytes = match read_stream.read(&mut buf).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        let mut streams_lock = streams.lock().await;
+                        streams_lock.remove(&my_node).await;
+                        println!(
+                            "There are {} active connections.",
+                            streams_lock.size().await
+                        );
+                        break;
+                    }
+                };
+
                 if n_bytes == 0 {
                     // the connection probably closed.
                     let mut streams_lock = streams.lock().await;
@@ -161,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => {
                         // broadcast the message
                         if let Some(ref mut node) = &mut streams.lock().await.head {
-                            broadcast(node, &buf[..n_bytes], &nickname[..]).await.unwrap();
+                            broadcast(node, &buf[..n_bytes], &nickname[..]).await.ok();
                         }
                     }
                 }
