@@ -112,18 +112,16 @@ async fn broadcast(
 }
 
 #[tokio::main]
-// HELP: Why does dyn work but not impl
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting");
     let listener = TcpListener::bind("0.0.0.0:8081").await?;
     let streams = Arc::new(Mutex::new(LinkedList::new()));
     loop {
         let (stream, _) = listener.accept().await?;
-        let (mut read_stream, write_stream) = split(stream);
-
         let streams = streams.clone();
         tokio::spawn(async move {
             let mut nickname: Vec<u8> = Vec::from(b"name".as_slice());
+            let (mut read_stream, write_stream) = split(stream);
 
             // we have to explicitly wrap this block in braces, or explicitly drop `stream_ll_head`
             // to drop the lock on the mutex. Otherwise, we can only handle on active connection
@@ -140,7 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut buf: [u8; BUF_SIZE] = [0; BUF_SIZE];
 
                 let n_bytes = match read_stream.read(&mut buf).await {
-                    Ok(n) => n,
                     Err(_) => {
                         let mut streams_lock = streams.lock().await;
                         streams_lock.remove(&my_node).await;
@@ -150,32 +147,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         break;
                     }
+                    Ok(0) => {
+                        let mut streams_lock = streams.lock().await;
+                        streams_lock.remove(&my_node).await;
+                        println!(
+                            "There are {} active connections.",
+                            streams_lock.size().await
+                        );
+                        break;
+                    },
+                    Ok(n) => n,
                 };
-
-                if n_bytes == 0 {
-                    // the connection probably closed.
-                    let mut streams_lock = streams.lock().await;
-                    streams_lock.remove(&my_node).await;
-                    println!(
-                        "There are {} active connections.",
-                        streams_lock.size().await
-                    );
-                    break;
-                }
 
                 match buf.strip_prefix(NICK_CMD) {
                     Some(nick) => {
                         // The user wants a new nickname
-                        // HELP: Still not feeling too confident on string/byte manipulation.
                         nickname.clear();
                         nickname.extend_from_slice(nick);
-                        // HELP: feels like there should be a better way to do this. I tried having
-                        // b'\n'.eq be the argument, but that didn't work.
                         nickname.retain(|x| *x != b'\n');
-                        // I hate that the formatter removes the braces
                     }
                     None => {
-                        // broadcast the message
                         if let Some(ref mut node) = &mut streams.lock().await.head {
                             broadcast(node, &buf[..n_bytes], &nickname[..]).await.ok();
                         }
